@@ -1,73 +1,82 @@
-import os
-import re
-import json
 import requests
-from playwright.sync_api import sync_playwright
+from bs4 import BeautifulSoup
+import json
+import os
 
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-STEAMRIP_URL = "https://steamrip.com/games-list-page/"
-
-def scrape_games_list():
-    """Scrapes all games from Steamrip A-Z list and returns list of {name, url}"""
-    print(f"🔍 Scraping {STEAMRIP_URL}...")
+def scrape_games():
+    url = "https://steamrip.com/games-list-page/"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    }
     
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        context = browser.new_context()
-        page = context.new_page()
-        page.goto(STEAMRIP_URL, wait_until="domcontentloaded", timeout=60000)
+    print(f"🔍 Scraping {url}...")
+    response = requests.get(url, headers=headers)
+    
+    if response.status_code != 200:
+        print(f"❌ Failed to fetch page. Status code: {response.status_code}")
+        return []
         
-        # Extract all game links from the A-Z list
-        games = page.evaluate("""() => {
-            const games = [];
-            // Target the actual game links in the A-Z directory
-            const links = document.querySelectorAll('.az-list-item a');
-            links.forEach(link => {
-                const name = link.innerText.trim();
-                const url = link.getAttribute('href');
-                if (name && url && !name.includes('Free Download')) {
-                    games.push({ name: name, url: url });
-                }
-            });
-            return games;
-        }""")
-        browser.close()
+    soup = BeautifulSoup(response.text, 'html.parser')
     
+    # Based on the provided HTML source, games are in: <li class="az-list-item"><a href="...">Title</a></li>
+    game_links = soup.select('li.az-list-item a')
+    
+    games = []
+    for link in game_links:
+        title = link.get_text(strip=True)
+        href = link.get('href')
+        
+        # Clean up the title slightly for better AI processing
+        clean_title = title.replace("Free Download", "").strip()
+        
+        # Ensure it's a valid absolute URL
+        if href and href.startswith('/'):
+            full_url = f"https://steamrip.com{href}"
+        else:
+            # Fallback for absolute URLs or malformed links
+            full_url = href if href else ""
+            
+        games.append({
+            "title": clean_title,
+            "url": full_url
+        })
+        
     print(f"✅ Found {len(games)} total games on Steamrip")
     return games
 
-def detect_collections_with_gemini(games):
-    """Sends game list to Gemini and returns dict of {game_name: is_collection_bool}"""
-    if not GEMINI_API_KEY:
-        raise ValueError("GEMINI_API_KEY environment variable not set")
+def find_collections(games):
+    print(f"🔍 Analyzing games for collections...")
     
-    # Prepare the list for Gemini - only send names and URLs
-    titles_for_ai = [{"name": g["name"], "url": g["url"]} for g in games]
+    # Filter down to only potential collections to save API calls and time
+    keywords = ["trilogy", "collection", "anthology", "chronicles", "compilation"]
+    potential_collections = [game['title'] for game in games if any(kw in game['title'].lower() for kw in keywords)]
     
-    prompt = f"""You are an expert video game analyst and Steam database expert.
-I have a list of game download titles from Steamrip. Some of these titles represent Steam bundles, anthologies, or collections containing multiple individual standalone PC games. Others are single standalone games.
+    print(f"📦 Found {len(potential_collections)} potential collections based on keywords.")
+    
+    if not potential_collections:
+        return {}
+        
+    gemini_api_key = os.environ.get("GEMINI_API_KEY")
+    if not gemini_api_key:
+        print("❌ GEMINI_API_KEY not found in environment variables.")
+        return {}
+    
+    prompt = f"""You are an expert in video game collections.
+I have a list of game titles from a website that are likely collections, anthologies, or trilogies.
+For each title, determine the EXACT individual game titles included in that collection.
+Return ONLY a valid JSON object where keys are the exact collection titles from the input, and values are arrays of the individual game titles.
 
-For EACH title provided, determine if it corresponds to a known Steam bundle/anthology/collection.
-
-CRITICAL RULES:
-1. If the title is a collection/bundle/anthology (e.g., 'Half-Life', 'Assassin's Creed Chronicles Trilogy'), return TRUE.
-2. If the title is strictly a single standalone game or DLC/expansion, return FALSE.
-3. Ignore console-specific bundles. Only focus on PC Steam bundles/anthologies.
-4. Return ONLY a valid JSON object where keys are the EXACT game names from input and values are boolean (true/false). Do not include markdown formatting.
-
-Format:
+Example:
 {{
-  "Exact Game Name From Input": true,
-  "Another Game Name": false
+  "Assassin's Creed Chronicles Trilogy": ["Assassin's Creed Chronicles: China", "Assassin's Creed Chronicles: India", "Assassin's Creed Chronicles: Russia"],
+  "Half-Life Anthology": ["Half-Life", "Half-Life: Opposing Force", "Half-Life: Blue Shift", "Team Fortress Classic"]
 }}
 
-Games to analyze ({len(titles_for_ai)} total):
-{json.dumps(titles_for_ai, indent=2)}
+Titles to analyze:
+{json.dumps(potential_collections, indent=2)}
 """
-    
-    print(f" Sending {len(titles_for_ai)} games to Gemini AI...")
-    
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent?key={GEMINI_API_KEY}"
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent?key={gemini_api_key}"
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {
@@ -76,42 +85,38 @@ Games to analyze ({len(titles_for_ai)} total):
         }
     }
     
-    r = requests.post(url, json=payload, timeout=300)
-    r.raise_for_status()
+    print("🤖 Sending to Gemini AI...")
+    response = requests.post(url, json=payload)
     
-    response_data = r.json()
-    candidates = response_data.get("candidates", [])
-    if not candidates:
-        raise ValueError("Gemini API returned no candidates")
-    
-    response_text = candidates[0].get("content", {}).get("parts", [{}])[0].get("text", "{}")
-    response_text = response_text.replace("```json", "").replace("```", "").strip()
-    
-    collection_map = json.loads(response_text)
-    print(f"✅ Gemini identified {sum(1 for v in collection_map.values() if v)} collections out of {len(collection_map)} games")
-    
-    return collection_map
+    if response.status_code != 200:
+        print(f"❌ Gemini API failed. Status code: {response.status_code}")
+        print(response.text)
+        return {}
+        
+    try:
+        data = response.json()
+        text = data["candidates"][0]["content"]["parts"][0]["text"]
+        text = text.replace("```json", "").replace("```", "").strip()
+        collections_data = json.loads(text)
+        print(f"✅ Gemini identified {len(collections_data)} collections.")
+        return collections_data
+    except Exception as e:
+        print(f"❌ Failed to parse Gemini response: {e}")
+        return {}
 
 if __name__ == "__main__":
-    try:
-        # Step 1: Scrape all games
-        games = scrape_games_list()
-        
-        # Save complete games list
-        with open("games_list.json", "w", encoding="utf-8") as f:
-            json.dump(games, f, indent=2, ensure_ascii=False)
-        print(f"💾 Saved games_list.json ({len(games)} games)")
-        
-        # Step 2: Detect collections via Gemini
-        collection_map = detect_collections_with_gemini(games)
-        
-        # Save collections map
-        with open("collections.json", "w", encoding="utf-8") as f:
-            json.dump(collection_map, f, indent=2, ensure_ascii=False)
-        print(f"💾 Saved collections.json ({sum(1 for v in collection_map.values() if v)} collections)")
-        
-        print("✅ Done!")
-        
-    except Exception as e:
-        print(f"❌ Error: {e}")
-        raise
+    games = scrape_games()
+    
+    # Save all games list (useful for debugging or future features)
+    with open("games_list.json", "w", encoding="utf-8") as f:
+        json.dump(games, f, indent=2)
+    print(f"💾 Saved games_list.json ({len(games)} games)")
+    
+    collections = find_collections(games)
+    
+    # Save the final collections mapping
+    with open("collections.json", "w", encoding="utf-8") as f:
+        json.dump(collections, f, indent=2)
+    print(f"💾 Saved collections.json ({len(collections)} collections)")
+    
+    print("✅ Done!")
