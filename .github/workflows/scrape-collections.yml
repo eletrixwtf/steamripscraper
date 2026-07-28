@@ -1,0 +1,44 @@
+name: Scrape Steamrip Collections
+
+on:
+  schedule:
+    # Run daily at midnight UTC
+    - cron: '0 0 * * *'
+  workflow_dispatch:  # Allow manual trigger
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      
+      - name: Install dependencies
+        run: |
+          pip install playwright requests
+          playwright install chromium
+      
+      - name: Run collection scraper
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: python scrape_collections.py
+      
+      - name: Upload collections.json artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: steamrip-collections
+          path: collections.json
+          retention-days: 30
+      
+      - name: Commit updated collections to repo
+        run: |
+          git config --local user.email "actions@github.com"
+          git config --local user.name "GitHub Actions Bot"
+          git add collections.json
+          git diff --quiet && git diff --staged --quiet || (git commit -m "Update collections.json [skip ci]" && git push)
