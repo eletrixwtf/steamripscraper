@@ -2,9 +2,12 @@ name: Scrape Steamrip Collections
 
 on:
   schedule:
-    # Run daily at midnight UTC
-    - cron: '0 0 * * *'
-  workflow_dispatch:  # Allow manual trigger
+    - cron: '0 0 * * *'  # Runs daily at midnight UTC
+  workflow_dispatch:      # Allows manual trigger
+
+# CRITICAL: This grants the workflow permission to push changes to the repo
+permissions:
+  contents: write
 
 jobs:
   scrape:
@@ -13,30 +16,24 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
       
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      
+          
       - name: Install dependencies
         run: |
-          pip install playwright requests
-          playwright install chromium
-      
-      - name: Run collection scraper
+          pip install requests beautifulsoup4
+          
+      - name: Run scraper
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: python scrape_collections.py
-      
-      - name: Upload collections.json artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: steamrip-collections
-          path: collections.json
-          retention-days: 30
-      
-      - name: Commit updated collections to repo
+        
+      - name: Commit and push results
         run: |
           git config --local user.email "actions@github.com"
           git config --local user.name "GitHub Actions Bot"
