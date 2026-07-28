@@ -1,9 +1,13 @@
-name: Scrape Steamrip Collections
+name: Scrape Steamrip Games
 
 on:
   schedule:
     - cron: '0 0 * * *'
   workflow_dispatch:
+
+# THIS FIXES THE 403 PERMISSION DENIED ERROR
+permissions:
+  contents: write
 
 jobs:
   scrape:
@@ -11,7 +15,9 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-        
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -23,13 +29,11 @@ jobs:
           playwright install chromium
           
       - name: Run scraper
-        env:
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-        run: python scrape_collections.py
+        run: python scrape_games.py
         
       - name: Commit and push results
         run: |
           git config --local user.email "actions@github.com"
           git config --local user.name "GitHub Actions Bot"
-          git add collections.json
-          git diff --quiet && git diff --staged --quiet || (git commit -m "Update collections.json [skip ci]" && git push)
+          git add games_list.json
+          git diff --quiet && git diff --staged --quiet || (git commit -m "Update games_list.json [skip ci]" && git push)
