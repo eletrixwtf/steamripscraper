@@ -1,185 +1,117 @@
 import os
+import re
 import json
-import time
-import logging
 import requests
 from playwright.sync_api import sync_playwright
 
-# ==========================================
-# CONFIGURATION & LOGGING
-# ==========================================
-logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
-logger = logging.getLogger(__name__)
-
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-if not GEMINI_API_KEY:
-    raise ValueError("GEMINI_API_KEY environment variable is not set!")
+STEAMRIP_URL = "https://steamrip.com/games-list-page/"
 
-GEMINI_MODEL = "gemini-3.5-flash-lite"
-
-# Keywords that strongly indicate a collection/bundle on Steamrip
-COLLECTION_KEYWORDS = [
-    "anthology", "trilogy", "collection", "complete edition", 
-    "complete pack", "bundle", "chronicles", "remastered collection"
-]
-
-# URLs to scrape (add more as needed)
-TARGET_URLS = [
-    "https://steamrip.com/games-list-page/",
-    # Add specific collection pages here if they aren't in the main list
-    # e.g., "https://steamrip.com/half-life-free-download-m1/"
-]
-
-def fetch_page_content(url: str) -> str | None:
-    """Scrape page content using Playwright."""
-    logger.info(f"Scraping {url}...")
-    try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True, args=['--disable-gpu', '--no-sandbox'])
-            context = browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-            page = context.new_page()
-            page.goto(url, wait_until="domcontentloaded", timeout=30000)
-            time.sleep(2)  # Allow dynamic content to load
-            
-            # Extract all visible text from the article/content area
-            content = page.evaluate("""() => {
-                // Try common content selectors first
-                const article = document.querySelector('article, .entry-content, .post-content, #the-post');
-                if (article) return article.innerText;
-                
-                // Fallback: get all body text but exclude nav/footer
-                const body = document.body.cloneNode(true);
-                ['nav', 'footer', 'header', 'script', 'style'].forEach(tag => {
-                    body.querySelectorAll(tag).forEach(el => el.remove());
-                });
-                return body.innerText;
-            }""")
-            browser.close()
-            
-        logger.info(f"Successfully scraped {len(content)} characters from {url}")
-        return content
-    except Exception as e:
-        logger.error(f"Failed to scrape {url}: {e}")
-        return None
-
-def detect_and_extract_games(title: str, content: str) -> list[str]:
-    """Use Gemini to determine if this is a collection and extract individual games."""
+def scrape_games_list():
+    """Scrapes all games from Steamrip A-Z list and returns list of {name, url}"""
+    print(f"🔍 Scraping {STEAMRIP_URL}...")
     
-    # Quick keyword check - skip if definitely not a collection
-    title_lower = title.lower()
-    if not any(kw in title_lower for kw in COLLECTION_KEYWORDS):
-        logger.debug(f"'{title}' doesn't match collection keywords, skipping.")
-        return []
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context()
+        page = context.new_page()
+        page.goto(STEAMRIP_URL, wait_until="domcontentloaded", timeout=60000)
+        
+        # Extract all game links from the A-Z list
+        games = page.evaluate("""() => {
+            const games = [];
+            // Target the actual game links in the A-Z directory
+            const links = document.querySelectorAll('.az-list-item a');
+            links.forEach(link => {
+                const name = link.innerText.trim();
+                const url = link.getAttribute('href');
+                if (name && url && !name.includes('Free Download')) {
+                    games.push({ name: name, url: url });
+                }
+            });
+            return games;
+        }""")
+        browser.close()
     
-    logger.info(f"Analyzing '{title}' for collection contents...")
+    print(f"✅ Found {len(games)} total games on Steamrip")
+    return games
+
+def detect_collections_with_gemini(games):
+    """Sends game list to Gemini and returns dict of {game_name: is_collection_bool}"""
+    if not GEMINI_API_KEY:
+        raise ValueError("GEMINI_API_KEY environment variable not set")
     
-    prompt = f"""You are an expert video game analyst specializing in Steamrip collections.
+    # Prepare the list for Gemini - only send names and URLs
+    titles_for_ai = [{"name": g["name"], "url": g["url"]} for g in games]
+    
+    prompt = f"""You are an expert video game analyst and Steam database expert.
+I have a list of game download titles from Steamrip. Some of these titles represent Steam bundles, anthologies, or collections containing multiple individual standalone PC games. Others are single standalone games.
 
-Analyze the following game page content. The page title is: "{title}"
+For EACH title provided, determine if it corresponds to a known Steam bundle/anthology/collection.
 
-Determine if this page represents a COLLECTION/BUNDLE containing multiple individual standalone PC games.
+CRITICAL RULES:
+1. If the title is a collection/bundle/anthology (e.g., 'Half-Life', 'Assassin's Creed Chronicles Trilogy'), return TRUE.
+2. If the title is strictly a single standalone game or DLC/expansion, return FALSE.
+3. Ignore console-specific bundles. Only focus on PC Steam bundles/anthologies.
+4. Return ONLY a valid JSON object where keys are the EXACT game names from input and values are boolean (true/false). Do not include markdown formatting.
 
-RULES:
-1. If it IS a collection, return ONLY a JSON array of the EXACT Steam store titles of each individual game included.
-2. If it is a single game or DLC, return an empty array [].
-3. Do NOT include DLCs, soundtracks, or non-game items in the output.
-4. Return ONLY valid JSON. No markdown formatting. No explanations.
+Format:
+{{
+  "Exact Game Name From Input": true,
+  "Another Game Name": false
+}}
 
-Examples:
-- "Half-Life Anthology" -> ["Half-Life", "Half-Life: Opposing Force", "Half-Life: Blue Shift"]
-- "Assassin's Creed Chronicles Trilogy" -> ["Assassin's Creed Chronicles: China", "Assassin's Creed Chronicles: India", "Assassin's Creed Chronicles: Russia"]
-- "Resident Evil 4 Ultimate HD Edition" -> []
-- "Cyberpunk 2077" -> []
-
-Page content:
-{content[:8000]}
+Games to analyze ({len(titles_for_ai)} total):
+{json.dumps(titles_for_ai, indent=2)}
 """
     
-    try:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
-        payload = {
-            "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {
-                "temperature": 0.0,
-                "response_mime_type": "application/json"
-            }
+    print(f" Sending {len(titles_for_ai)} games to Gemini AI...")
+    
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "temperature": 0.0,
+            "response_mime_type": "application/json"
         }
-        
-        r = requests.post(url, json=payload, timeout=30)
-        r.raise_for_status()
-        
-        response_data = r.json()
-        candidates = response_data.get("candidates", [])
-        if not candidates:
-            logger.warning(f"No candidates returned for '{title}'")
-            return []
-        
-        response_text = candidates[0].get("content", {}).get("parts", [{}])[0].get("text", "[]")
-        response_text = response_text.replace("```json", "").replace("```", "").strip()
-        
-        result = json.loads(response_text)
-        
-        if isinstance(result, list) and len(result) > 0:
-            logger.info(f"'{title}' contains {len(result)} games: {result}")
-            return result
-        else:
-            logger.debug(f"'{title}' is not a collection (returned: {result})")
-            return []
-            
-    except Exception as e:
-        logger.error(f"Gemini analysis failed for '{title}': {e}")
-        return []
-
-def main():
-    """Main entry point for GitHub Actions."""
-    logger.info("=" * 60)
-    logger.info("Steamrip Collection Scraper Starting")
-    logger.info("=" * 60)
+    }
     
-    results = {}
+    r = requests.post(url, json=payload, timeout=300)
+    r.raise_for_status()
     
-    for url in TARGET_URLS:
-        content = fetch_page_content(url)
-        if not content:
-            continue
-        
-        # Extract potential collection titles from the page
-        # Look for links/titles that contain collection keywords
-        potential_collections = []
-        
-        # Parse the page for game titles that look like collections
-        lines = content.split('\n')
-        for line in lines:
-            line = line.strip()
-            if any(kw in line.lower() for kw in COLLECTION_KEYWORDS) and len(line) < 200:
-                # Clean up the title
-                title = line.split('Free Download')[0].strip()
-                if title and len(title) > 5:
-                    potential_collections.append((title, content))
-        
-        # Also check if the page itself might be a collection based on its URL/title
-        page_title = url.split('/')[-1].replace('-', ' ').replace('.html', '').title()
-        if any(kw in page_title.lower() for kw in COLLECTION_KEYWORDS):
-            potential_collections.insert(0, (page_title, content))
-        
-        logger.info(f"Found {len(potential_collections)} potential collections on {url}")
-        
-        for title, content in potential_collections:
-            games = detect_and_extract_games(title, content)
-            if games:
-                results[title] = games
+    response_data = r.json()
+    candidates = response_data.get("candidates", [])
+    if not candidates:
+        raise ValueError("Gemini API returned no candidates")
     
-    # Save results
-    output_file = "collections.json"
-    with open(output_file, 'w', encoding='utf-8') as f:
-        json.dump(results, f, indent=2, ensure_ascii=False)
+    response_text = candidates[0].get("content", {}).get("parts", [{}])[0].get("text", "{}")
+    response_text = response_text.replace("```json", "").replace("```", "").strip()
     
-    logger.info("=" * 60)
-    logger.info(f"Results saved to {output_file}")
-    logger.info(f"Total collections found: {len(results)}")
-    for title, games in results.items():
-        logger.info(f"  - {title}: {len(games)} games")
-    logger.info("=" * 60)
+    collection_map = json.loads(response_text)
+    print(f"✅ Gemini identified {sum(1 for v in collection_map.values() if v)} collections out of {len(collection_map)} games")
+    
+    return collection_map
 
 if __name__ == "__main__":
-    main()
+    try:
+        # Step 1: Scrape all games
+        games = scrape_games_list()
+        
+        # Save complete games list
+        with open("games_list.json", "w", encoding="utf-8") as f:
+            json.dump(games, f, indent=2, ensure_ascii=False)
+        print(f"💾 Saved games_list.json ({len(games)} games)")
+        
+        # Step 2: Detect collections via Gemini
+        collection_map = detect_collections_with_gemini(games)
+        
+        # Save collections map
+        with open("collections.json", "w", encoding="utf-8") as f:
+            json.dump(collection_map, f, indent=2, ensure_ascii=False)
+        print(f"💾 Saved collections.json ({sum(1 for v in collection_map.values() if v)} collections)")
+        
+        print("✅ Done!")
+        
+    except Exception as e:
+        print(f"❌ Error: {e}")
+        raise
