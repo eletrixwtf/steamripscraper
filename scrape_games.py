@@ -50,18 +50,18 @@ def main():
         print(f"❌ Failed to fetch games list: {e}")
         # Save empty JSON to avoid workflow failure
         with open("games_list.json", "w", encoding="utf-8") as f:
-            json.dump([], f, indent=2)
+            json.dump([], f, indent=2, ensure_ascii=False)
         return
 
     if not games:
         print("❌ No games found. Exiting.")
         with open("games_list.json", "w", encoding="utf-8") as f:
-            json.dump([], f, indent=2)
+            json.dump([], f, indent=2, ensure_ascii=False)
         return
 
     print("💾 Saving to games_list.json...")
     with open("games_list.json", "w", encoding="utf-8") as f:
-        json.dump(games, f, indent=2)
+        json.dump(games, f, indent=2, ensure_ascii=False)
     print("✅ Saved successfully!")
 
 if __name__ == "__main__":
